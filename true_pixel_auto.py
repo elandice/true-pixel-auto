@@ -18,7 +18,8 @@ mcp = MCPServer("true-pixel-auto")
 
 def process_pixel_art(image_path, target_width=64, target_height=64, n_colors=16, upscale_factor=1):
     """변환 후 (저장된 경로 리스트, 실제 사용 색상 수)를 반환."""
-    img = np.asarray(Image.open(image_path).convert("RGB"))
+    rgba = np.asarray(Image.open(image_path).convert("RGBA"))
+    img, opaque = rgba[..., :3], rgba[..., 3] >= 128  # 반투명 경계는 알파 128 기준으로 투명/불투명 결정
     orig_h, orig_w, _ = img.shape
     if not (1 <= target_width <= orig_w and 1 <= target_height <= orig_h):
         raise ValueError(f"목표 해상도 {target_width}x{target_height}는 1 이상, 원본 {orig_w}x{orig_h} 이하여야 합니다")
@@ -26,13 +27,18 @@ def process_pixel_art(image_path, target_width=64, target_height=64, n_colors=16
         raise ValueError("n_colors는 1~256 범위여야 합니다 (인덱스 PNG 한계)")
     if upscale_factor < 1:
         raise ValueError("upscale_factor는 1 이상이어야 합니다")
+    if not opaque.any():
+        raise ValueError("이미지 전체가 투명합니다")
 
     # 1. K-Means 팔레트를 먼저 학습: 노이즈 낀 RGB 대신 팔레트 인덱스의 최빈값을 쓰면 블록에 없는 색이 섞여 나오지 않음
+    #    불투명 픽셀만 학습에 써서 투명 영역에 숨은 RGB가 팔레트를 오염시키지 않게 함
     pixels = img.reshape(-1, 3).astype(np.float32)
-    sample = pixels[np.random.default_rng(42).choice(len(pixels), min(len(pixels), 20000), replace=False)]
-    k = min(n_colors, len(np.unique(sample, axis=0)))
+    visible = pixels[opaque.ravel()]
+    sample = visible[np.random.default_rng(42).choice(len(visible), min(len(visible), 20000), replace=False)]
+    k = min(n_colors, len(np.unique(sample, axis=0)), 256 if opaque.all() else 255)  # 투명 인덱스 자리 확보
     kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(sample)
     labels = kmeans.predict(pixels).reshape(orig_h, orig_w)
+    labels[~opaque] = k  # 라벨 k = 투명
 
     # 2. 격자 블록마다 최빈 팔레트 인덱스(Mode)로 다운스케일 → 경계 안티에일리어싱 제거
     ys = np.linspace(0, orig_h, target_height + 1).astype(int)
@@ -40,22 +46,25 @@ def process_pixel_art(image_path, target_width=64, target_height=64, n_colors=16
     grid = np.empty((target_height, target_width), dtype=np.int64)
     for i in range(target_height):
         for j in range(target_width):
-            grid[i, j] = np.bincount(labels[ys[i]:ys[i + 1], xs[j]:xs[j + 1]].ravel(), minlength=k).argmax()
+            grid[i, j] = np.bincount(labels[ys[i]:ys[i + 1], xs[j]:xs[j + 1]].ravel(), minlength=k + 1).argmax()
 
     # 3. 실제 쓰인 색만 팔레트에 남겨 인덱스 PNG로 저장 (팔레트 재양자화 없이 K-Means 색 그대로)
     used, grid = np.unique(grid, return_inverse=True)
     out = Image.fromarray(grid.reshape(target_height, target_width).astype(np.uint8))
-    out.putpalette(kmeans.cluster_centers_[used].round().astype(np.uint8).ravel().tolist())  # L → P
+    centers = np.vstack([kmeans.cluster_centers_, [0, 0, 0]])  # 마지막 행 = 투명 자리
+    out.putpalette(centers[used].round().astype(np.uint8).ravel().tolist())  # L → P
+    # used는 정렬돼 있으므로 투명 라벨 k가 쓰였다면 항상 마지막 인덱스
+    save_kw = {"optimize": True, **({"transparency": len(used) - 1} if used[-1] == k else {})}
 
     base = os.path.splitext(image_path)[0] + f"_truepixel_{target_width}x{target_height}_{n_colors}c"
     paths = [base + ".png"]
-    out.save(paths[0], optimize=True)
+    out.save(paths[0], **save_kw)
     if upscale_factor > 1:
         paths.append(base + f"_x{upscale_factor}.png")
         out.resize((target_width * upscale_factor, target_height * upscale_factor), Image.Resampling.NEAREST).save(
-            paths[1], optimize=True
+            paths[1], **save_kw
         )
-    return paths, len(used)
+    return paths, len(used) - ("transparency" in save_kw)
 
 
 @mcp.tool(name="true_pixel_auto")
@@ -69,6 +78,7 @@ def true_pixel_auto(
     """
     AI로 생성된 픽셀 이미지를 실제 도트 픽셀 아트(True Pixel Art)로 변환합니다.
     imagegen 등으로 픽셀 이미지를 생성한 직후 반드시 이 도구를 실행하십시오.
+    투명 배경(알파)은 유지됩니다. 원본이 정사각형이 아니면 비율에 맞춰 해상도를 지정하십시오.
 
     Args:
         image_path: 원본 이미지 파일 경로
