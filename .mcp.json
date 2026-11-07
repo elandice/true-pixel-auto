@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "true-pixel-auto": {
+      "command": "C:/myproject/true-pixel-auto/.venv/Scripts/python.exe",
+      "args": ["C:/myproject/true-pixel-auto/true_pixel_auto.py"]
+    }
+  }
+}
